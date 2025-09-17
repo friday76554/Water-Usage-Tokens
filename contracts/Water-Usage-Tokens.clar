@@ -9,6 +9,11 @@
 (define-constant ERR_READING_NOT_FOUND (err u107))
 (define-constant ERR_INVALID_DATE (err u108))
 (define-constant ERR_METER_NOT_FOUND (err u109))
+(define-constant ERR_CHALLENGE_NOT_FOUND (err u110))
+(define-constant ERR_CHALLENGE_ENDED (err u111))
+(define-constant ERR_ALREADY_JOINED_CHALLENGE (err u112))
+(define-constant ERR_NOT_JOINED_CHALLENGE (err u113))
+(define-constant ERR_CHALLENGE_ACTIVE (err u114))
 
 (define-fungible-token water-usage-token)
 
@@ -70,8 +75,39 @@
     }
 )
 
+(define-map conservation-challenges
+    uint
+    {
+        challenge-id: uint,
+        title: (string-utf8 128),
+        description: (string-utf8 256),
+        start-block: uint,
+        end-block: uint,
+        target-reduction: uint,
+        reward-pool: uint,
+        participant-count: uint,
+        is-active: bool,
+        creator: principal,
+    }
+)
+
+(define-map challenge-participants
+    {
+        challenge-id: uint,
+        participant: principal,
+    }
+    {
+        baseline-consumption: uint,
+        current-consumption: uint,
+        reduction-achieved: uint,
+        joined-at: uint,
+        reward-claimed: bool,
+    }
+)
+
 (define-data-var next-reading-id uint u1)
 (define-data-var contract-paused bool false)
+(define-data-var next-challenge-id uint u1)
 
 (define-read-only (get-name)
     (ok "Water Usage Token")
@@ -127,6 +163,24 @@
 
 (define-read-only (is-contract-paused)
     (var-get contract-paused)
+)
+
+(define-read-only (get-conservation-challenge (challenge-id uint))
+    (map-get? conservation-challenges challenge-id)
+)
+
+(define-read-only (get-challenge-participant
+        (challenge-id uint)
+        (participant principal)
+    )
+    (map-get? challenge-participants {
+        challenge-id: challenge-id,
+        participant: participant,
+    })
+)
+
+(define-read-only (get-active-challenges)
+    (var-get next-challenge-id)
 )
 
 (define-read-only (calculate-tokens-for-consumption (consumption uint))
@@ -734,6 +788,192 @@
             amount: amount,
         })
         (ok true)
+    )
+)
+
+(define-public (create-conservation-challenge
+        (title (string-utf8 128))
+        (description (string-utf8 256))
+        (duration-blocks uint)
+        (target-reduction uint)
+        (reward-pool uint)
+    )
+    (let (
+            (challenge-id (var-get next-challenge-id))
+            (start-block stacks-block-height)
+            (end-block (+ start-block duration-blocks))
+        )
+        (begin
+            (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+            (asserts! (> duration-blocks u0) ERR_INVALID_AMOUNT)
+            (asserts! (> target-reduction u0) ERR_INVALID_AMOUNT)
+            (asserts! (> reward-pool u0) ERR_INVALID_AMOUNT)
+            (map-set conservation-challenges challenge-id {
+                challenge-id: challenge-id,
+                title: title,
+                description: description,
+                start-block: start-block,
+                end-block: end-block,
+                target-reduction: target-reduction,
+                reward-pool: reward-pool,
+                participant-count: u0,
+                is-active: true,
+                creator: tx-sender,
+            })
+            (var-set next-challenge-id (+ challenge-id u1))
+            (print {
+                action: "challenge-created",
+                challenge-id: challenge-id,
+                title: title,
+            })
+            (ok challenge-id)
+        )
+    )
+)
+
+(define-public (join-conservation-challenge (challenge-id uint))
+    (let (
+            (challenge (unwrap! (map-get? conservation-challenges challenge-id)
+                ERR_CHALLENGE_NOT_FOUND
+            ))
+            (user-data (unwrap! (map-get? user-balances tx-sender) ERR_NOT_REGISTERED))
+            (participant-key {
+                challenge-id: challenge-id,
+                participant: tx-sender,
+            })
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+            (asserts! (get is-active challenge) ERR_CHALLENGE_ENDED)
+            (asserts! (< stacks-block-height (get end-block challenge))
+                ERR_CHALLENGE_ENDED
+            )
+            (asserts! (is-none (map-get? challenge-participants participant-key))
+                ERR_ALREADY_JOINED_CHALLENGE
+            )
+            (map-set challenge-participants participant-key {
+                baseline-consumption: (get total-consumption user-data),
+                current-consumption: u0,
+                reduction-achieved: u0,
+                joined-at: stacks-block-height,
+                reward-claimed: false,
+            })
+            (map-set conservation-challenges challenge-id
+                (merge challenge { participant-count: (+ (get participant-count challenge) u1) })
+            )
+            (print {
+                action: "challenge-joined",
+                challenge-id: challenge-id,
+                participant: tx-sender,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (update-challenge-progress (challenge-id uint))
+    (let (
+            (challenge (unwrap! (map-get? conservation-challenges challenge-id)
+                ERR_CHALLENGE_NOT_FOUND
+            ))
+            (participant-key {
+                challenge-id: challenge-id,
+                participant: tx-sender,
+            })
+            (participant-data (unwrap! (map-get? challenge-participants participant-key)
+                ERR_NOT_JOINED_CHALLENGE
+            ))
+            (user-data (unwrap! (map-get? user-balances tx-sender) ERR_NOT_REGISTERED))
+            (baseline (get baseline-consumption participant-data))
+            (current-total (get total-consumption user-data))
+            (reduction (if (> baseline current-total)
+                (- baseline current-total)
+                u0
+            ))
+        )
+        (begin
+            (asserts! (get is-active challenge) ERR_CHALLENGE_ENDED)
+            (map-set challenge-participants participant-key
+                (merge participant-data {
+                    current-consumption: current-total,
+                    reduction-achieved: reduction,
+                })
+            )
+            (print {
+                action: "challenge-progress-updated",
+                challenge-id: challenge-id,
+                participant: tx-sender,
+                reduction: reduction,
+            })
+            (ok reduction)
+        )
+    )
+)
+
+(define-public (claim-challenge-reward (challenge-id uint))
+    (let (
+            (challenge (unwrap! (map-get? conservation-challenges challenge-id)
+                ERR_CHALLENGE_NOT_FOUND
+            ))
+            (participant-key {
+                challenge-id: challenge-id,
+                participant: tx-sender,
+            })
+            (participant-data (unwrap! (map-get? challenge-participants participant-key)
+                ERR_NOT_JOINED_CHALLENGE
+            ))
+            (reduction (get reduction-achieved participant-data))
+            (target (get target-reduction challenge))
+        )
+        (begin
+            (asserts! (>= stacks-block-height (get end-block challenge))
+                ERR_CHALLENGE_ACTIVE
+            )
+            (asserts! (not (get reward-claimed participant-data))
+                ERR_UNAUTHORIZED
+            )
+            (asserts! (>= reduction target) ERR_INSUFFICIENT_TOKENS)
+            (let (
+                    (reward-amount (/ (get reward-pool challenge)
+                        (get participant-count challenge)
+                    ))
+                    (bonus-reward (/ (* reduction u5) u100))
+                    (total-reward (+ reward-amount bonus-reward))
+                )
+                (try! (ft-mint? water-usage-token total-reward tx-sender))
+                (map-set challenge-participants participant-key
+                    (merge participant-data { reward-claimed: true })
+                )
+                (print {
+                    action: "challenge-reward-claimed",
+                    challenge-id: challenge-id,
+                    participant: tx-sender,
+                    reward: total-reward,
+                })
+                (ok total-reward)
+            )
+        )
+    )
+)
+
+(define-public (end-conservation-challenge (challenge-id uint))
+    (let ((challenge (unwrap! (map-get? conservation-challenges challenge-id)
+            ERR_CHALLENGE_NOT_FOUND
+        )))
+        (begin
+            (asserts! (is-eq tx-sender (get creator challenge)) ERR_UNAUTHORIZED)
+            (asserts! (>= stacks-block-height (get end-block challenge))
+                ERR_CHALLENGE_ACTIVE
+            )
+            (map-set conservation-challenges challenge-id
+                (merge challenge { is-active: false })
+            )
+            (print {
+                action: "challenge-ended",
+                challenge-id: challenge-id,
+            })
+            (ok true)
+        )
     )
 )
 
