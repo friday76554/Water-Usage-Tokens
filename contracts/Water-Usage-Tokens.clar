@@ -14,12 +14,23 @@
 (define-constant ERR_ALREADY_JOINED_CHALLENGE (err u112))
 (define-constant ERR_NOT_JOINED_CHALLENGE (err u113))
 (define-constant ERR_CHALLENGE_ACTIVE (err u114))
+(define-constant ERR_INSUFFICIENT_ALLOWANCE (err u115))
 
 (define-fungible-token water-usage-token)
 
 (define-data-var token-uri (optional (string-utf8 256)) none)
 (define-data-var total-water-consumed uint u0)
 (define-data-var token-price uint u1000000)
+
+(define-map allowances
+    {
+        owner: principal,
+        spender: principal,
+    }
+    {
+        amount: uint,
+    }
+)
 
 (define-map water-meters
     principal
@@ -125,6 +136,13 @@
     (ok (ft-get-balance water-usage-token owner))
 )
 
+(define-read-only (get-allowance (owner principal) (spender principal))
+    (match (map-get? allowances { owner: owner, spender: spender })
+        data (ok (get amount data))
+        (ok u0)
+    )
+)
+
 (define-read-only (get-total-supply)
     (ok (ft-get-supply water-usage-token))
 )
@@ -214,6 +232,52 @@
             amount: amount,
         })
         (ok true)
+    )
+)
+
+(define-public (approve (spender principal) (amount uint))
+    (let ((caller tx-sender))
+        (begin
+            (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+            (asserts! (not (is-eq caller spender)) ERR_INVALID_RECIPIENT)
+            (map-set allowances { owner: caller, spender: spender } { amount: amount })
+            (print {
+                action: "approve",
+                owner: caller,
+                spender: spender,
+                amount: amount,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (transfer-from
+        (amount uint)
+        (owner principal)
+        (recipient principal)
+        (memo (optional (buff 34)))
+    )
+    (let (
+            (spender tx-sender)
+            (allowed (default-to u0 (get amount (map-get? allowances { owner: owner, spender: spender }))))
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+            (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+            (asserts! (not (is-eq owner recipient)) ERR_INVALID_RECIPIENT)
+            (asserts! (>= allowed amount) ERR_INSUFFICIENT_ALLOWANCE)
+            (try! (ft-transfer? water-usage-token amount owner recipient))
+            (map-set allowances { owner: owner, spender: spender } { amount: (- allowed amount) })
+            (print {
+                action: "transfer-from",
+                spender: spender,
+                owner: owner,
+                recipient: recipient,
+                amount: amount,
+            })
+            (ok true)
+        )
     )
 )
 
