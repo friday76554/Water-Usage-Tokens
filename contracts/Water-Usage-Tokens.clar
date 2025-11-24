@@ -27,9 +27,12 @@
         owner: principal,
         spender: principal,
     }
-    {
-        amount: uint,
-    }
+    { amount: uint }
+)
+
+(define-map reading-validators
+    principal
+    { enabled: bool }
 )
 
 (define-map water-meters
@@ -136,8 +139,14 @@
     (ok (ft-get-balance water-usage-token owner))
 )
 
-(define-read-only (get-allowance (owner principal) (spender principal))
-    (match (map-get? allowances { owner: owner, spender: spender })
+(define-read-only (get-allowance
+        (owner principal)
+        (spender principal)
+    )
+    (match (map-get? allowances {
+        owner: owner,
+        spender: spender,
+    })
         data (ok (get amount data))
         (ok u0)
     )
@@ -235,12 +244,19 @@
     )
 )
 
-(define-public (approve (spender principal) (amount uint))
+(define-public (approve
+        (spender principal)
+        (amount uint)
+    )
     (let ((caller tx-sender))
         (begin
             (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
             (asserts! (not (is-eq caller spender)) ERR_INVALID_RECIPIENT)
-            (map-set allowances { owner: caller, spender: spender } { amount: amount })
+            (map-set allowances {
+                owner: caller,
+                spender: spender,
+            } { amount: amount }
+            )
             (print {
                 action: "approve",
                 owner: caller,
@@ -260,7 +276,13 @@
     )
     (let (
             (spender tx-sender)
-            (allowed (default-to u0 (get amount (map-get? allowances { owner: owner, spender: spender }))))
+            (allowed (default-to u0
+                (get amount
+                    (map-get? allowances {
+                        owner: owner,
+                        spender: spender,
+                    })
+                )))
         )
         (begin
             (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
@@ -268,7 +290,11 @@
             (asserts! (not (is-eq owner recipient)) ERR_INVALID_RECIPIENT)
             (asserts! (>= allowed amount) ERR_INSUFFICIENT_ALLOWANCE)
             (try! (ft-transfer? water-usage-token amount owner recipient))
-            (map-set allowances { owner: owner, spender: spender } { amount: (- allowed amount) })
+            (map-set allowances {
+                owner: owner,
+                spender: spender,
+            } { amount: (- allowed amount) }
+            )
             (print {
                 action: "transfer-from",
                 spender: spender,
@@ -357,7 +383,15 @@
             (caller tx-sender)
         )
         (begin
-            (asserts! (is-eq caller CONTRACT_OWNER) ERR_UNAUTHORIZED)
+            (asserts!
+                (or
+                    (is-eq caller CONTRACT_OWNER)
+                    (default-to false
+                        (get enabled (map-get? reading-validators caller))
+                    )
+                )
+                ERR_UNAUTHORIZED
+            )
             (asserts! (not (get validated reading)) ERR_UNAUTHORIZED)
             (if is-valid
                 (begin
@@ -384,6 +418,29 @@
                     })
                     (ok false)
                 )
+            )
+        )
+    )
+)
+
+(define-read-only (is-reading-validator (user principal))
+    (ok (default-to false (get enabled (map-get? reading-validators user))))
+)
+
+(define-public (set-reading-validator
+        (user principal)
+        (enabled bool)
+    )
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (if enabled
+            (begin
+                (map-set reading-validators user { enabled: true })
+                (ok true)
+            )
+            (begin
+                (map-delete reading-validators user)
+                (ok true)
             )
         )
     )
